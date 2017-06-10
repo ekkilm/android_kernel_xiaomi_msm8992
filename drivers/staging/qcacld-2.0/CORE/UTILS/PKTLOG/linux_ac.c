@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2015 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2016 The Linux Foundation. All rights reserved.
  *
  * Previously licensed under the ISC license by Qualcomm Atheros, Inc.
  *
@@ -51,7 +51,11 @@
 #define PKTLOG_DEVNAME_SIZE	32
 #define MAX_WLANDEV		1
 
+#ifdef MULTI_IF_NAME
+#define PKTLOG_PROC_DIR		"ath_pktlog" MULTI_IF_NAME
+#else
 #define PKTLOG_PROC_DIR		"ath_pktlog"
+#endif
 
 /* Permissions for creating proc entries */
 #define PKTLOG_PROC_PERM	0444
@@ -118,6 +122,7 @@ int pktlog_alloc_buf(struct ol_softc *scn)
 	unsigned long vaddr;
 	struct page *vpg;
 	struct ath_pktlog_info *pl_info;
+	struct ath_pktlog_buf *buffer;
 
 	if (!scn || !scn->pdev_txrx_handle->pl_dev) {
 		printk(PKTLOG_TAG
@@ -131,19 +136,28 @@ int pktlog_alloc_buf(struct ol_softc *scn)
 
 	page_cnt = (sizeof(*(pl_info->buf)) + pl_info->buf_size) / PAGE_SIZE;
 
-	if ((pl_info->buf = vmalloc((page_cnt + 2) * PAGE_SIZE)) == NULL) {
+	spin_lock_bh(&pl_info->log_lock);
+	if(pl_info->buf != NULL) {
+		printk("Buffer is already in use\n");
+		spin_unlock_bh(&pl_info->log_lock);
+		return -EINVAL;
+	}
+	spin_unlock_bh(&pl_info->log_lock);
+
+	if ((buffer = vmalloc((page_cnt + 2) * PAGE_SIZE)) == NULL) {
 		printk(PKTLOG_TAG
 		       "%s: Unable to allocate buffer "
 		       "(%d pages)\n", __func__, page_cnt);
 		return -ENOMEM;
 	}
 
-	pl_info->buf = (struct ath_pktlog_buf *)
-			(((unsigned long) (pl_info->buf) + PAGE_SIZE - 1)
+
+	buffer = (struct ath_pktlog_buf *)
+			(((unsigned long) (buffer) + PAGE_SIZE - 1)
 			& PAGE_MASK);
 
-	for (vaddr = (unsigned long) (pl_info->buf);
-	     vaddr < ((unsigned long) (pl_info->buf) + (page_cnt * PAGE_SIZE));
+	for (vaddr = (unsigned long) (buffer);
+	     vaddr < ((unsigned long) (buffer) + (page_cnt * PAGE_SIZE));
 	     vaddr += PAGE_SIZE) {
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,25))
 		vpg = vmalloc_to_page((const void *) vaddr);
@@ -153,6 +167,12 @@ int pktlog_alloc_buf(struct ol_softc *scn)
 		SetPageReserved(vpg);
 	}
 
+	spin_lock_bh(&pl_info->log_lock);
+	if(pl_info->buf != NULL)
+		pktlog_release_buf(scn);
+
+	pl_info->buf =  buffer;
+	spin_unlock_bh(&pl_info->log_lock);
 	return 0;
 }
 
@@ -196,6 +216,7 @@ pktlog_cleanup(struct ath_pktlog_info *pl_info)
 {
 	pl_info->log_state = 0;
 	PKTLOG_LOCK_DESTROY(pl_info);
+	mutex_destroy(&pl_info->pktlog_mutex);
 }
 
 /* sysctl procfs handler to enable pktlog */
@@ -436,7 +457,7 @@ static int pktlog_attach(struct ol_softc *scn)
 	pl_dev = get_pl_handle(scn);
 
 	if (pl_dev != NULL) {
-		pl_info_lnx = kmalloc(sizeof(*pl_info_lnx), GFP_KERNEL);
+		pl_info_lnx = vos_mem_malloc(sizeof(*pl_info_lnx));
 		if (pl_info_lnx == NULL) {
 			printk(PKTLOG_TAG "%s:allocation failed for pl_info\n",
 			       __func__);
@@ -506,7 +527,7 @@ attach_fail2:
 
 attach_fail1:
 	if (pl_dev)
-		kfree(pl_dev->pl_info);
+		vos_mem_free(pl_dev->pl_info);
 	return -1;
 }
 
@@ -544,13 +565,15 @@ static void pktlog_detach(struct ol_softc *scn)
 	pl_info = pl_dev->pl_info;
 	remove_proc_entry(WLANDEV_BASENAME, g_pktlog_pde);
 	pktlog_sysctl_unregister(pl_dev);
-	pktlog_cleanup(pl_info);
 
+	spin_lock_bh(&pl_info->log_lock);
 	if (pl_info->buf)
 		pktlog_release_buf(scn);
+	spin_unlock_bh(&pl_info->log_lock);
+	pktlog_cleanup(pl_info);
 
 	if (pl_dev) {
-		kfree(pl_info);
+		vos_mem_free(pl_info);
 		pl_dev->pl_info = NULL;
 	}
 }
@@ -570,139 +593,6 @@ static int pktlog_release(struct inode *i, struct file *f)
 #ifndef MIN
 #define MIN(a,b) (((a) < (b)) ? (a) : (b))
 #endif
-
-/**
- * pktlog_send_per_pkt_stats_to_user() - This function is used to send the per
- * packet statistics to the user
- *
- * This function is used to send the per packet statistics to the user
- *
- * Return: Success if the message is posted to user
- *
- */
-int pktlog_send_per_pkt_stats_to_user(void)
-{
-	ssize_t ret_val;
-	struct vos_log_pktlog_info *pktlog = NULL;
-	void *vos = vos_get_global_context(VOS_MODULE_ID_HIF, NULL);
-	ol_txrx_pdev_handle txrx_pdev =
-		vos_get_context(VOS_MODULE_ID_TXRX, vos);
-	struct ath_pktlog_info *pl_info;
-	bool read_complete;
-	uint32_t num_bytes_read = 0;
-
-	/*
-	 * We do not want to do this packet stats related processing when
-	 * packet log tool is run. i.e., we want this processing to be
-	 * done only when start logging command of packet stats is initiated.
-	 */
-	if ((vos_get_ring_log_level(RING_ID_PER_PACKET_STATS) <
-				WLAN_LOG_LEVEL_ACTIVE)) {
-		printk(PKTLOG_TAG " %s: Shouldnt happen. Logging not started\n",
-			__func__);
-		return -EINVAL;
-	}
-
-	if (!txrx_pdev) {
-		printk(PKTLOG_TAG " %s: Invalid TxRx handle\n", __func__);
-		return -EINVAL;
-	}
-
-	pl_info = txrx_pdev->pl_dev->pl_info;
-
-	if (!pl_info || !pl_info->buf) {
-		printk(PKTLOG_TAG " %s: Shouldnt happen. pl_info is invalid\n",
-			 __func__);
-		return -EINVAL;
-	}
-
-	if (pl_info->buf->rd_offset == -1) {
-		printk(PKTLOG_TAG " %s: Shouldnt happen. No write yet!\n",
-			__func__);
-		return -EINVAL;
-	}
-
-	do {
-		pktlog = (struct vos_log_pktlog_info *)
-			    vos_mem_malloc(sizeof(struct vos_log_pktlog_info) +
-						VOS_LOG_PKT_LOG_SIZE);
-		if (!pktlog) {
-			printk(PKTLOG_TAG " %s: Memory allocation failed\n",
-				__func__);
-			return -ENOMEM;
-		}
-
-		vos_mem_zero(pktlog, VOS_LOG_PKT_LOG_SIZE);
-		vos_log_set_code(pktlog, LOG_WLAN_PKT_LOG_INFO_C);
-
-		pktlog->buf_len = 0;
-		pktlog->version = VERSION_LOG_WLAN_PKT_LOG_INFO_C;
-
-		/*
-		 * @ret_val: ret_val gives the actual data read from the buffer.
-		 * When there is no more data to read, this value will be zero
-		 * @offset: offset in the ring buffer. Initially it is zero and
-		 * is incremented during every read based on number of bytes
-		 * read
-		 */
-		ret_val = pktlog_read_proc_entry(pktlog->buf,
-						 VOS_LOG_PKT_LOG_SIZE,
-						 &pl_info->buf->offset,
-						 pl_info, &read_complete);
-		if (ret_val) {
-			int index = 0;
-			struct ath_pktlog_hdr *temp;
-			while (1) {
-				if ((ret_val - index) <
-						sizeof(struct ath_pktlog_hdr)) {
-					/* Partial header */
-					pl_info->buf->offset -=
-							(ret_val - index);
-					ret_val = index;
-					break;
-				}
-				temp = (struct ath_pktlog_hdr *)
-							(pktlog->buf + index);
-				if ((ret_val - index) < (temp->size +
-					    sizeof(struct ath_pktlog_hdr))) {
-					/* Partial record payload */
-					pl_info->buf->offset -=
-							(ret_val - index);
-					ret_val = index;
-					break;
-				}
-				index += temp->size +
-					sizeof(struct ath_pktlog_hdr);
-			}
-		}
-
-		/* Data will include message index/seq number and buf length */
-		pktlog->buf_len = ret_val;
-		if (ret_val) {
-			vos_log_set_length(pktlog, ret_val +
-					   sizeof(struct vos_log_pktlog_info));
-			pktlog->seq_no = pl_info->buf->msg_index++;
-			WLAN_VOS_DIAG_LOG_REPORT(pktlog);
-		} else {
-			vos_mem_free(pktlog);
-		}
-		num_bytes_read += ret_val;
-		/*
-		 * If the logger thread is scheduled late and the proc entry
-		 * is having too much data to be read, we might start to starve
-		 * the other threads if we continuously keep reading the proc
-		 * entry. So, having a threshold to break this read from proc
-		 * entry.
-		 */
-		if (num_bytes_read > VOS_LOG_PKT_LOG_THRESHOLD) {
-			read_complete = true;
-			printk(PKTLOG_TAG " %s: Break read to prevent starve\n",
-				__func__);
-		}
-	} while (read_complete == false);
-
-	return 0;
-}
 
 /**
  * pktlog_read_proc_entry() - This function is used to read data from the
@@ -730,12 +620,16 @@ pktlog_read_proc_entry(char *buf, size_t nbytes, loff_t *ppos,
 	int rem_len;
 	int start_offset, end_offset;
 	int fold_offset, ppos_data, cur_rd_offset, cur_wr_offset;
-	struct ath_pktlog_buf *log_buf = pl_info->buf;
+	struct ath_pktlog_buf *log_buf;
+
+	spin_lock_bh(&pl_info->log_lock);
+	log_buf = pl_info->buf;
 
 	*read_complete = false;
 
 	if (log_buf == NULL) {
 		*read_complete = true;
+		spin_unlock_bh(&pl_info->log_lock);
 		return 0;
 	}
 
@@ -838,7 +732,6 @@ rd_done:
 	*ppos += ret_val;
 
 	if (ret_val == 0) {
-		PKTLOG_LOCK(pl_info);
 		/* Write pointer might have been updated during the read.
 		 * So, if some data is written into, lets not reset the pointers.
 		 * We can continue to read from the offset position
@@ -852,14 +745,13 @@ rd_done:
 			pl_info->buf->offset = PKTLOG_READ_OFFSET;
 			*read_complete = true;
 		}
-		PKTLOG_UNLOCK(pl_info);
 	}
-
+	spin_unlock_bh(&pl_info->log_lock);
 	return ret_val;
 }
 
 static ssize_t
-pktlog_read(struct file *file, char *buf, size_t nbytes, loff_t *ppos)
+__pktlog_read(struct file *file, char *buf, size_t nbytes, loff_t *ppos)
 {
 	size_t bufhdr_size;
 	size_t count = 0, ret_val = 0;
@@ -868,16 +760,21 @@ pktlog_read(struct file *file, char *buf, size_t nbytes, loff_t *ppos)
 	int fold_offset, ppos_data, cur_rd_offset;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
 	struct ath_pktlog_info *pl_info = (struct ath_pktlog_info *)
-					  PDE_DATA(file->f_dentry->d_inode);
+					  PDE_DATA(file->f_path.dentry->d_inode);
 #else
 	struct proc_dir_entry *proc_entry = PDE(file->f_dentry->d_inode);
 	struct ath_pktlog_info *pl_info = (struct ath_pktlog_info *)
 					  proc_entry->data;
 #endif
-	struct ath_pktlog_buf *log_buf = pl_info->buf;
+	struct ath_pktlog_buf *log_buf;
 
-	if (log_buf == NULL)
+	spin_lock_bh(&pl_info->log_lock);
+	log_buf = pl_info->buf;
+
+	if (log_buf == NULL) {
+		spin_unlock_bh(&pl_info->log_lock);
 		return 0;
+	}
 
 	if (*ppos == 0 && pl_info->log_state) {
 		pl_info->saved_state = pl_info->log_state;
@@ -892,11 +789,13 @@ pktlog_read(struct file *file, char *buf, size_t nbytes, loff_t *ppos)
 
 	if (*ppos < bufhdr_size) {
 		count = MIN((bufhdr_size - *ppos), rem_len);
+		spin_unlock_bh(&pl_info->log_lock);
 		if (copy_to_user(buf, ((char *)&log_buf->bufhdr) + *ppos,
 				 count))
 			return -EFAULT;
 		rem_len -= count;
 		ret_val += count;
+		spin_lock_bh(&pl_info->log_lock);
 	}
 
 	start_offset = log_buf->rd_offset;
@@ -938,21 +837,25 @@ pktlog_read(struct file *file, char *buf, size_t nbytes, loff_t *ppos)
 			goto rd_done;
 
 		count = MIN(rem_len, (end_offset - ppos_data + 1));
+		spin_unlock_bh(&pl_info->log_lock);
 		if (copy_to_user(buf + ret_val,
 				 log_buf->log_data + ppos_data,
 				 count))
 			return -EFAULT;
 		ret_val += count;
 		rem_len -= count;
+		spin_lock_bh(&pl_info->log_lock);
 	} else {
 		if (ppos_data <= fold_offset) {
 			count = MIN(rem_len, (fold_offset - ppos_data + 1));
+			spin_unlock_bh(&pl_info->log_lock);
 			if (copy_to_user(buf + ret_val,
 					 log_buf->log_data + ppos_data,
 					 count))
 				return -EFAULT;
 			ret_val += count;
 			rem_len -= count;
+			spin_lock_bh(&pl_info->log_lock);
 		}
 
 		if (rem_len == 0)
@@ -964,12 +867,14 @@ pktlog_read(struct file *file, char *buf, size_t nbytes, loff_t *ppos)
 
 		if (ppos_data <= end_offset) {
 			count = MIN(rem_len, (end_offset - ppos_data + 1));
+			spin_unlock_bh(&pl_info->log_lock);
 			if (copy_to_user(buf + ret_val,
 					 log_buf->log_data + ppos_data,
 					 count))
 				return -EFAULT;
 			ret_val += count;
 			rem_len -= count;
+			spin_lock_bh(&pl_info->log_lock);
 		}
 	}
 
@@ -980,6 +885,25 @@ rd_done:
 	}
 	*ppos += ret_val;
 
+	spin_unlock_bh(&pl_info->log_lock);
+	return ret_val;
+}
+
+static ssize_t
+pktlog_read(struct file *file, char *buf, size_t nbytes, loff_t *ppos)
+{
+	size_t ret_val = 0;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
+	struct ath_pktlog_info *pl_info = (struct ath_pktlog_info *)
+					  PDE_DATA(file->f_path.dentry->d_inode);
+#else
+	struct proc_dir_entry *proc_entry = PDE(file->f_dentry->d_inode);
+	struct ath_pktlog_info *pl_info = (struct ath_pktlog_info *)
+					  proc_entry->data;
+#endif
+	mutex_lock(&pl_info->pktlog_mutex);
+	ret_val = __pktlog_read(file, buf, nbytes, ppos);
+	mutex_unlock(&pl_info->pktlog_mutex);
 	return ret_val;
 }
 
@@ -1109,7 +1033,7 @@ static int pktlog_mmap(struct file *file, struct vm_area_struct *vma)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
 	struct ath_pktlog_info *pl_info = (struct ath_pktlog_info *)
-					  PDE_DATA(file->f_dentry->d_inode);
+					  PDE_DATA(file->f_path.dentry->d_inode);
 #else
 	struct proc_dir_entry *proc_entry = PDE(file->f_dentry->d_inode);
 	struct ath_pktlog_info *pl_info = (struct ath_pktlog_info *)
