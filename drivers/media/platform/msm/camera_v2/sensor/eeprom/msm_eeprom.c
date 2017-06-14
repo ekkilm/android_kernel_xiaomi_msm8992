@@ -23,9 +23,14 @@
 
 DEFINE_MSM_MUTEX(msm_eeprom_mutex);
 
-#ifdef CONFIG_MACH_LIBRA
 #define EEPROM_ONSEMI_ADDR 0x7C
+#ifdef CONFIG_MACH_LEO
+#define EEPROM_IC_ONSEMI
+#else
+#undef EEPROM_IC_ONSEMI
+#endif
 
+#ifdef CONFIG_MACH_XIAOMI_MSM8992
 #define X7_FRONT_MODULE_ID_OFFSET 0x1
 #define X7_FRONT_PAGE0_OFFSET 0x20
 #define X7_FRONT_PAGE1_OFFSET 0x10
@@ -100,15 +105,17 @@ static int msm_eeprom_verify_sum(const char *mem, uint32_t size, uint32_t sum)
 		return -EINVAL;
 
 	crc = crc32_le(crc, mem, size);
+#ifndef EEPROM_IC_ONSEMI
 	if (~crc != sum) {
 		CDBG("%s: expect 0x%x, result 0x%x\n", __func__, sum, ~crc);
 		return -EINVAL;
 	}
+#endif
 	CDBG("%s: checksum pass 0x%x\n", __func__, sum);
 	return 0;
 }
 
-#ifdef CONFIG_MACH_LIBRA
+#ifdef CONFIG_MACH_XIAOMI_MSM8992
 static void set_back_sensor_name(struct msm_eeprom_ctrl_t *e_ctrl,
 		char *mapdata)
 {
@@ -573,7 +580,7 @@ static int read_eeprom_memory(struct msm_eeprom_ctrl_t *e_ctrl,
 {
 	int rc = 0;
 	int j;
-#ifdef CONFIG_MACH_LIBRA
+#ifdef CONFIG_MACH_XIAOMI_MSM8992
 	int delay;
 	char out[4];
 	uint32_t temp;
@@ -598,7 +605,7 @@ static int read_eeprom_memory(struct msm_eeprom_ctrl_t *e_ctrl,
 				eb_info->i2c_slaveaddr);
 		}
 
-#ifdef CONFIG_MACH_LIBRA
+#ifdef CONFIG_MACH_XIAOMI_MSM8992
 		if (emap[j].page.valid_size &&
 				eb_info->i2c_slaveaddr == EEPROM_ONSEMI_ADDR) {
 			temp = htonl(emap[j].page.data);
@@ -621,7 +628,7 @@ static int read_eeprom_memory(struct msm_eeprom_ctrl_t *e_ctrl,
 			rc = e_ctrl->i2c_client.i2c_func_tbl->i2c_write(
 				&(e_ctrl->i2c_client), emap[j].page.addr,
 				emap[j].page.data, emap[j].page.data_t);
-#ifdef CONFIG_MACH_LIBRA
+#ifdef CONFIG_MACH_XIAOMI_MSM8992
 				delay = emap[j].page.delay * 1000;
 				usleep_range(delay, delay + 100);
 #else
@@ -637,7 +644,7 @@ static int read_eeprom_memory(struct msm_eeprom_ctrl_t *e_ctrl,
 			rc = e_ctrl->i2c_client.i2c_func_tbl->i2c_write(
 				&(e_ctrl->i2c_client), emap[j].pageen.addr,
 				emap[j].pageen.data, emap[j].pageen.data_t);
-#ifdef CONFIG_MACH_LIBRA
+#ifdef CONFIG_MACH_XIAOMI_MSM8992
 				delay = emap[j].pageen.delay;
 				usleep_range(delay, delay + 100);
 #else
@@ -653,7 +660,7 @@ static int read_eeprom_memory(struct msm_eeprom_ctrl_t *e_ctrl,
 			rc = e_ctrl->i2c_client.i2c_func_tbl->i2c_poll(
 				&(e_ctrl->i2c_client), emap[j].poll.addr,
 				emap[j].poll.data, emap[j].poll.data_t);
-#ifdef CONFIG_MACH_LIBRA
+#ifdef CONFIG_MACH_XIAOMI_MSM8992
 				delay = emap[j].poll.delay;
 				usleep_range(delay, delay + 100);
 #else
@@ -687,7 +694,7 @@ static int read_eeprom_memory(struct msm_eeprom_ctrl_t *e_ctrl,
 			}
 		}
 	}
-#ifdef CONFIG_MACH_LIBRA
+#ifdef CONFIG_MACH_XIAOMI_MSM8992
 	x7_set_sensor_name(e_ctrl, block->mapdata);
 	x11_set_sensor_name(e_ctrl, block->mapdata);
 #endif
@@ -858,7 +865,7 @@ static int msm_eeprom_get_dt_data(struct msm_eeprom_ctrl_t *e_ctrl)
 		&e_ctrl->eboard_info->power_info;
 	struct device_node *of_node = NULL;
 	struct msm_camera_gpio_conf *gconf = NULL;
-	uint16_t gpio_array_size = 0;
+	int16_t gpio_array_size = 0;
 	uint16_t *gpio_array = NULL;
 
 	eb_info = e_ctrl->eboard_info;
@@ -895,7 +902,7 @@ static int msm_eeprom_get_dt_data(struct msm_eeprom_ctrl_t *e_ctrl)
 	gpio_array_size = of_gpio_count(of_node);
 	CDBG("%s gpio count %d\n", __func__, gpio_array_size);
 
-	if (gpio_array_size) {
+	if (gpio_array_size > 0) {
 		gpio_array = kzalloc(sizeof(uint16_t) * gpio_array_size,
 			GFP_KERNEL);
 		if (!gpio_array) {
@@ -1167,7 +1174,7 @@ static int msm_eeprom_spi_remove(struct spi_device *sdev)
 static int eeprom_config_read_cal_data32(struct msm_eeprom_ctrl_t *e_ctrl,
 	void __user *arg)
 {
-	int rc;
+	int rc = -EINVAL;
 	uint8_t *ptr_dest = NULL;
 	struct msm_eeprom_cfg_data32 *cdata32 =
 		(struct msm_eeprom_cfg_data32 *) arg;

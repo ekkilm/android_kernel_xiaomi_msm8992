@@ -624,7 +624,7 @@ static void msm_sensor_fill_sensor_info(struct msm_sensor_ctrl_t *s_ctrl,
 	strlcpy(entity_name, s_ctrl->msm_sd.sd.entity.name, MAX_SENSOR_NAME);
 }
 
-#ifdef CONFIG_MACH_LIBRA
+#ifdef CONFIG_MACH_XIAOMI_MSM8992
 extern int x7_get_back_sensor_name(char *);
 extern int x11_get_back_sensor_name(char *);
 extern int x11_get_front_sensor_name(char *);
@@ -641,7 +641,7 @@ int32_t msm_sensor_driver_probe(void *setting,
 	struct msm_camera_slave_info        *camera_info = NULL;
 
 	unsigned long                        mount_pos = 0;
-#ifdef CONFIG_MACH_LIBRA
+#ifdef CONFIG_MACH_XIAOMI_MSM8992
 	char x7_back_sensor_name[32];
 	char x11_back_sensor_name[32];
 	char x7_front_sensor_name[32];
@@ -730,7 +730,7 @@ int32_t msm_sensor_driver_probe(void *setting,
 		}
 	}
 
-#ifdef CONFIG_MACH_LIBRA
+#ifdef CONFIG_MACH_XIAOMI_MSM8992
 	if (strcmp(slave_info->eeprom_name, "sony_imx214") == 0) {
 		x7_get_back_sensor_name(x7_back_sensor_name);
 		CDBG("slave_info sensor_name = %s, back_sensor_name - %s\n",
