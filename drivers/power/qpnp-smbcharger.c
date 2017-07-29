@@ -3119,6 +3119,15 @@ static void smbchg_external_power_changed(struct power_supply *psy)
 	smbchg_aicl_deglitch_wa_check(chip);
 	if (chip->bms_psy) {
 		check_battery_type(chip);
+
+#ifdef CONFIG_MACH_XIAOMI_MSM8992
+		rc = smbchg_charging_en(chip, true);
+		if (rc < 0)
+			pr_smb(PR_MISC,
+				"Couldn't enable battery charging rc=%d\n",
+									rc);
+#endif
+
 		soc = get_prop_batt_capacity(chip);
 		if (chip->previous_soc != soc) {
 			chip->previous_soc = soc;
@@ -4939,6 +4948,17 @@ static int smbchg_hw_init(struct smbchg_chip *chip)
 				rc);
 		return rc;
 	}
+
+#ifdef CONFIG_MACH_XIAOMI_MSM8992
+	/* Turn off AICL ADC to improve accuracy */
+	rc = smbchg_sec_masked_write(chip, chip->misc_base + MISC_TRIM_OPT_15_8,
+			CHG_EN_COMMAND_BIT | CHG_EN_SRC_BIT, 0);
+	if (rc < 0) {
+		dev_err(chip->dev, "Couldn't disable AICL ADC function rc=%d\n",
+				rc);
+		return rc;
+	}
+#endif
 
 	/*
 	 * Do not force using current from the register i.e. use auto
